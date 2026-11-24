@@ -5,3 +5,6 @@ edgar_cache/
 edgar_annual.csv
 edgar_inspect_*.txt
 .env
+price_cache/
+backtest_results.csv
+backtest_picks.csv

@@ -123,6 +123,13 @@ def ticker_to_cik(s: requests.Session) -> dict:
 
 # ---------------------------------------------------------------- parsing
 
+FILED_SLACK_DAYS = 45  # an amended 10-K/A shortly after the original still counts as "same time"
+
+
+def within_days(filed: str, reference: str, days: int) -> bool:
+    return (pd.Timestamp(filed) - pd.Timestamp(reference)).days <= days
+
+
 def first_reported(gaap: dict, concept: str, unit: str, kind: str) -> dict:
     """{period_end: (filed, value)} for one concept, using the earliest 10-K that reported it."""
     first_seen = {}
@@ -162,10 +169,19 @@ def extract(facts: dict) -> pd.DataFrame:
                 per_concept.append({e: (max(fa[e][0], fb[e][0]), fa[e][1] + fb[e][1])
                                     for e in fa.keys() & fb.keys()})
 
-        # 2) Combine the concepts: highest priority wins, or the largest value for TAKE_MAX fields
-        combined = {}
+        # 2) Combine the concepts. Only values that were public when the year was FIRST
+        #    reported count - companies often re-file old years under new names later
+        #    (e.g. after the 2018 revenue rule change), and using those dates would make
+        #    the year look unknown until years later.
+        earliest = {}
         for first_seen in per_concept:
+            for end, (filed, _) in first_seen.items():
+                earliest[end] = min(filed, earliest.get(end, filed))
+        combined = {}
+        for first_seen in per_concept:  # priority order
             for end, (filed, val) in first_seen.items():
+                if not within_days(filed, earliest[end], FILED_SLACK_DAYS):
+                    continue
                 if end not in combined:
                     combined[end] = (val, filed)
                 elif field in TAKE_MAX and val > combined[end][0]:
@@ -175,14 +191,15 @@ def extract(facts: dict) -> pd.DataFrame:
     year_ends = sorted(set().union(*(values[f] for f in CORE)))
     rows = []
     for end in year_ends:
-        row = {"period_end": end}
-        filed_dates = []
+        # The year becomes "known" when its revenue/net income were first filed (the 10-K date).
+        filed = max(values[f][end][1] for f in CORE if end in values[f])
+        row = {"period_end": end, "filed": filed}
         for field in CONCEPTS:
             if end in values[field]:
-                row[field], filed = values[field][end]
-                filed_dates.append(filed)
-        # Conservative: the year counts as "known" once ALL of its numbers were public.
-        row["filed"] = max(filed_dates)
+                val, field_filed = values[field][end]
+                # A number that only showed up in a LATER report would be peeking ahead - skip it.
+                if within_days(field_filed, filed, FILED_SLACK_DAYS):
+                    row[field] = val
         rows.append(row)
     return pd.DataFrame(rows, columns=["period_end", "filed", *CONCEPTS])
 
