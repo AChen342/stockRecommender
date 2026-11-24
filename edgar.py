@@ -42,6 +42,11 @@ TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 REQUEST_PAUSE = 0.15  # SEC allows max 10 requests/second
 
+# Tickers whose SEC mapping points at a new entity with no filing history yet.
+# XOM now maps to "ExxonMobil Holdings Corporation" (a new holding company, no 10-Ks),
+# while the years of history live under the original Exxon Mobil Corp (CIK 34088).
+CIK_OVERRIDES = {"XOM": 34088}
+
 # field -> (XBRL concept names in priority order, unit, kind)
 # Companies don't all use the same names, and many switched names over time
 # (e.g. SalesRevenueNet -> RevenueFromContractWithCustomer... after a 2018 rule change),
@@ -54,6 +59,11 @@ CONCEPTS = {
         "SalesRevenueNet",
         "SalesRevenueGoodsNet",
         "RevenuesNetOfInterestExpense",
+        "RegulatedAndUnregulatedOperatingRevenue",  # utilities (e.g. DTE)
+        "RegulatedOperatingRevenue",
+        "UtilityRevenue",
+        "OperatingLeasesIncomeStatementLeaseRevenue",  # REITs: rent
+        "OperatingLeaseLeaseIncome",
     ], "USD", "duration"),
     "net_income": (["NetIncomeLoss", "ProfitLoss"], "USD", "duration"),
     "op_cash_flow": ([
@@ -75,6 +85,9 @@ CONCEPTS = {
 # Banks, REITs and insurers report only fee income as "RevenueFromContractWithCustomer...",
 # with interest, rent and premiums under other names - the total is the biggest one.
 TAKE_MAX = {"revenue"}
+# Revenue built by adding two concepts. Banks' main income (net interest income) isn't
+# filed under any "revenue" name, so their revenue = net interest income + fee income.
+SUMMED_REVENUE = [("InterestIncomeExpenseNet", "NoninterestIncome")]
 CORE = ["revenue", "net_income"]  # a fiscal year needs at least one of these to be kept
 
 
@@ -104,10 +117,31 @@ def get_json(s: requests.Session, url: str, tries: int = 4):
 def ticker_to_cik(s: requests.Session) -> dict:
     """The SEC identifies companies by CIK number, not ticker."""
     data = get_json(s, TICKER_URL)
-    return {row["ticker"].upper().replace(".", "-"): int(row["cik_str"]) for row in data.values()}
+    ciks = {row["ticker"].upper().replace(".", "-"): int(row["cik_str"]) for row in data.values()}
+    return {**ciks, **CIK_OVERRIDES}
 
 
 # ---------------------------------------------------------------- parsing
+
+def first_reported(gaap: dict, concept: str, unit: str, kind: str) -> dict:
+    """{period_end: (filed, value)} for one concept, using the earliest 10-K that reported it."""
+    first_seen = {}
+    for f in gaap.get(concept, {}).get("units", {}).get(unit, []):
+        if not str(f.get("form", "")).startswith("10-K"):  # annual reports only
+            continue
+        end, filed = f.get("end"), f.get("filed")
+        if not end or not filed:
+            continue
+        if kind == "duration":  # must cover a full year, not a quarter
+            if not f.get("start"):
+                continue
+            days = (pd.Timestamp(end) - pd.Timestamp(f["start"])).days
+            if not 330 <= days <= 400:
+                continue
+        if end not in first_seen or filed < first_seen[end][0]:
+            first_seen[end] = (filed, f["val"])
+    return first_seen
+
 
 def extract(facts: dict) -> pd.DataFrame:
     """Turn one company's raw SEC facts into one row per fiscal year.
@@ -121,24 +155,12 @@ def extract(facts: dict) -> pd.DataFrame:
 
     for field, (concepts, unit, kind) in CONCEPTS.items():
         # 1) For each concept, the earliest-filed annual value per fiscal year end
-        per_concept = []  # list of {period_end: (filed, value)}, in priority order
-        for concept in concepts:
-            first_seen = {}
-            for f in gaap.get(concept, {}).get("units", {}).get(unit, []):
-                if not str(f.get("form", "")).startswith("10-K"):  # annual reports only
-                    continue
-                end, filed = f.get("end"), f.get("filed")
-                if not end or not filed:
-                    continue
-                if kind == "duration":  # must cover a full year, not a quarter
-                    if not f.get("start"):
-                        continue
-                    days = (pd.Timestamp(end) - pd.Timestamp(f["start"])).days
-                    if not 330 <= days <= 400:
-                        continue
-                if end not in first_seen or filed < first_seen[end][0]:
-                    first_seen[end] = (filed, f["val"])
-            per_concept.append(first_seen)
+        per_concept = [first_reported(gaap, c, unit, kind) for c in concepts]
+        if field == "revenue":
+            for a, b in SUMMED_REVENUE:
+                fa, fb = first_reported(gaap, a, unit, kind), first_reported(gaap, b, unit, kind)
+                per_concept.append({e: (max(fa[e][0], fb[e][0]), fa[e][1] + fb[e][1])
+                                    for e in fa.keys() & fb.keys()})
 
         # 2) Combine the concepts: highest priority wins, or the largest value for TAKE_MAX fields
         combined = {}
@@ -167,10 +189,13 @@ def extract(facts: dict) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- main download
 
-def download(refresh: bool = False) -> pd.DataFrame:
+def download(refresh: bool = False, only: list | None = None) -> pd.DataFrame:
     s = make_session()
     RAW_DIR.mkdir(exist_ok=True)
     tickers = pd.read_csv(FUNDAMENTALS).ticker.tolist()
+    if only:  # re-download just these tickers
+        tickers = [t.upper().replace(".", "-") for t in only]
+        refresh = True
     cik_map = ticker_to_cik(s)
 
     for i, t in enumerate(tickers, 1):
@@ -268,8 +293,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download annual financials from SEC EDGAR.")
     parser.add_argument("--refresh", action="store_true", help="re-download every company")
     parser.add_argument("--inspect", metavar="TICKER", help="list the revenue/income names one company uses")
+    parser.add_argument("--tickers", nargs="+", metavar="TICKER",
+                        help="re-download only these tickers, e.g. --tickers DTE XOM")
     args = parser.parse_args()
     if args.inspect:
         inspect(args.inspect)
     else:
-        download(args.refresh)
+        download(args.refresh, args.tickers)
