@@ -3,6 +3,8 @@ import requests
 import argparse
 import io, time
 import yfinance as yf
+
+import edgar
 from pathlib import Path
 
 CACHE = Path(__file__).parent / "fundamentals.csv"
@@ -85,6 +87,23 @@ def get_data() -> pd.DataFrame:
     return df
 
 
+def apply_edgar_history(df: pd.DataFrame, years: int) -> pd.DataFrame:
+    """Swap Yahoo's ~4-year history for SEC EDGAR's longer one where available."""
+    df = df.copy()
+    df["histSource"] = "Yahoo"
+    if not edgar.ANNUAL_FILE.exists():
+        print("Tip: run `python edgar.py` to use 8+ years of SEC history instead of Yahoo's ~4.\n")
+        return df
+
+    hist = edgar.history_asof(edgar.load_annual(), years=years).reindex(df.ticker)
+    use = (hist.histYears >= 3).to_numpy()  # only replace when EDGAR has enough years
+    for c in HIST_COLS:
+        df.loc[use, c] = hist[c].to_numpy()[use]
+    df.loc[use, "histSource"] = "EDGAR"
+    print(f"History: EDGAR (up to {years} yrs) for {use.sum()} stocks, Yahoo for {(~use).sum()}\n")
+    return df
+
+
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["sector"])
     df = df[df.profitMargins > 0]
@@ -161,6 +180,7 @@ def explain(row: pd.Series) -> str:
         f"  - Growth:  revenue {fmt(row.revenueGrowth, '+.0%')} latest, "
         f"{fmt(row.revCagr, '+.0%', '/yr')} multi-year{top_pct(row.growth_rank)}"
     )
+    lines.append(f"  - History: {fmt(row.histYears, '.0f')} yrs from {row.histSource}")
     if pd.isna(row.avgMargin):
         lines.append("  - Note: not enough history to check for a cyclical peak")
     elif row.avgMargin <= 0:
@@ -190,6 +210,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sector", action="append",
                         help='only include this sector; repeat for several, e.g. --sector Technology --sector Healthcare')
     parser.add_argument("--refresh", action="store_true", help="re-download data even if the cache is fresh")
+    parser.add_argument("--history-years", type=int, default=8,
+                        help="years of SEC history to average over (default: 8)")
     args = parser.parse_args()
 
     if any(w < 0 for w in args.weights) or sum(args.weights) == 0:
@@ -209,6 +231,7 @@ def main():
     else:
         df = get_data()
 
+    df = apply_edgar_history(df, args.history_years)
     df = clean_data(df)
 
     if args.sector:

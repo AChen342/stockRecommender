@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+fundamentals.csv
+edgar_cache/
+edgar_annual.csv
+edgar_inspect_*.txt
+.env
